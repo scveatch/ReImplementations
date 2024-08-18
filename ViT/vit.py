@@ -2,6 +2,10 @@
 A module that implements "An Image is worth 16x16 words" by Dosovitskiy et al. 
 
 """
+# Hyperparameters 
+##################################
+NUM_EPOCHS = 3
+LR = 0.005
 
 import math # GCD, sqrt
 import torch  # For tensor operations and ML
@@ -9,7 +13,7 @@ from torch import nn # For layers
 import torch.utils.data  # Dataloaders
 from torchvision import datasets, transforms  # For MNIST data; transformations
 import matplotlib.pyplot as plt # Visualizations
-
+from tqdm import tqdm
 
 # Helper Functions
 ##################################
@@ -96,7 +100,7 @@ def patch(images, n_patches):
                 patch_index += 1
     return patches
 
-class MHSA():
+class MHSA(nn.Module):
     """
     Multi-head Self Attention Class. 
     """
@@ -119,13 +123,13 @@ class MHSA():
         
         self.dim_heads = self.D // self.heads
         # Generate mappings for Query, Key, Value for each number of heads
-        self.q_mappings = nn.Module([
+        self.q_mappings = nn.ModuleList([
             nn.Linear(self.dim_heads, self.dim_heads) for _ in range(self.heads)
         ])
-        self.k_mappings = nn.Module([
+        self.k_mappings = nn.ModuleList([
             nn.Linear(self.dim_heads, self.dim_heads) for _ in range(self.heads)
         ])
-        self.v_mappings = nn.Module([
+        self.v_mappings = nn.ModuleList([
             nn.Linear(self.dim_heads, self.dim_heads) for _ in range(self.heads)
         ])
 
@@ -146,7 +150,7 @@ class MHSA():
         result = []
         for sequence in sequences:
             seq_result = []
-            for head in self.heads:
+            for head in range(self.heads):
                 q_map = self.q_mappings[head]
                 k_map = self.k_mappings[head]
                 v_map = self.v_mappings[head]
@@ -163,8 +167,20 @@ class MHSA():
             result.append(torch.hstack(seq_result))
         return torch.cat([torch.unsqueeze(r, dim = 0) for r in result]) # return to shape (b, s, t)
 
-class VitBlock():
+class VitBlock(nn.Module):
+    """
+    Vision Transformer Block. Consists of layer normalization, 
+    MHSA, and an MLP layer with GELU activation, as described in 
+    the paper. 
+    """
     def __init__(self, token_dim, heads, mlp_size):
+        """
+        Initializes the VIT block.
+        Args:
+            token_dim (int): The dimensions of the patch input
+            heads (int): The number of heads in the model. 
+            mlp_size (int): The hidden dimensions of the MLP layer.
+        """
         super(VitBlock, self).__init__()
         self.token_dim = token_dim
         self.heads = heads
@@ -174,42 +190,92 @@ class VitBlock():
         self.mhsa = MHSA(self.token_dim, self.heads)
         self.norm2 = nn.LayerNorm(self.token_dim)
         # expand to mlp_size hidden layers, shrink to token_dim
-        self.mlp = nn.Sequential([
+        self.mlp = nn.Sequential(
             nn.Linear(self.token_dim, self.mlp_size * self.token_dim), 
             nn.GELU(),
             nn.Linear(self.token_dim * self.mlp_size, self.token_dim)
-        ])
+        )
     
-    def forward(self, x):
-        out = x + self.mhsa(self.norm1(x))
+    def forward(self, patch):
+        """
+        Forward method for VitBlock
+
+        Args:
+            patch (torch.tensor): A 1D image patch with 
+            positional embeddings, of the shape token_dim
+
+        Returns:
+            torch.tensor: Output patch of same size
+        """
+        out = patch + self.mhsa(self.norm1(patch))
         out = out + self.mlp(self.norm2(out))
         return out 
     
-class ViT():
-    def __init__(self, chw, n_patches, n_vit_blocks, hidden_d, token_dim, heads = 2, mlp_size = 4, out_d = 10):
+class ViT(nn.Module):
+    def __init__(self, chw, n_patches, n_vit_blocks, hidden_d, heads = 2, mlp_size = 4, out_d = 10):
         super(ViT, self).__init__()
         self.chw = chw
         self.n_patches = n_patches
         self.n_vit = n_vit_blocks
         self.hidden_d = hidden_d
-        self.token_dim = token_dim
         self.heads = heads
         self.mlp_size = mlp_size
         self.out_d = out_d
 
-        sequence_len = chw[0] * chw[1] * chw[2] // n_patches 
+        self.input_d = chw[0] * chw[1] * chw[2] // n_patches
 
-        self.linear_proj = (sequence_len, hidden_d)
+        self.linear_proj = nn.Linear(self.input_d, hidden_d) 
 
         self.class_token = nn.Parameter(torch.rand(1, self.hidden_d))
 
         self.register_buffer(
-            "positional embeddings", 
-            get_positional_embeddings(sequence_len, self.hidden_d)
-
+            "positional_embeddings", 
+            get_positional_embeddings(self.n_patches + 1, self.hidden_d),
+            persistent = False
         )
 
+        self.blocks = nn.ModuleList([
+            VitBlock(self.hidden_d, self.heads, mlp_size= 4) for _ in range(self.n_vit)
+        ])
+
+        self.mlp = nn.Sequential(nn.Linear(self.hidden_d, self.out_d), nn.Softmax(dim = -1))
+
+    def forward(self, images):
+        b, c, h, w = images.shape
+
+        patches = patch(images, self.n_patches).to(self.positional_embeddings.device)
+
+        # Map vector corresponding to patch to the hidden size
+        proj_tokens = self.linear_proj(patches)
+
+        # Prepend class token
+        tokens = torch.cat((self.class_token.expand(b, 1, -1), proj_tokens), dim = 1)
+
+        # Add class token 
+        vit_in = tokens + self.positional_embeddings.repeat(b, 1, 1) 
+
+        for block in self.blocks:
+            vit_in = block(vit_in)
+
+        # Get classification token only.
+        mlp_in = vit_in[:, 0]
+
+        return self.mlp(mlp_in)
+
+
+
 def get_positional_embeddings(sequence_len, dimensions):
+    """
+    Get the positional embeddings for the image patches
+
+    Args:
+        sequence_len (int): The length of the 1D image input vector. 
+        dimensions (int): The number of hidden dimensions in the model
+
+    Returns:
+        torch.tensor: The positional embeddings with the same shape as 
+        model dimensions, allowing them to be summed. 
+    """
     result = torch.ones(sequence_len, dimensions)
 
     for i in range(sequence_len):
@@ -221,14 +287,75 @@ def get_positional_embeddings(sequence_len, dimensions):
     return result
 
 
+def main():
+    transform = transforms.ToTensor()
+    train = datasets.MNIST("./data", train = True, download= True, transform=transform)
+    test = datasets.MNIST("./data", train = False, download= True, transform=transform)
+    train_loader = torch.utils.data.DataLoader(train)
+    test_loader = torch.utils.data.DataLoader(test)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Using device {torch.cuda.get_device_name(device)}")
 
+    best_test_loss = 99999999
+
+    model = ViT(
+        chw= (1, 28, 28), n_patches= 4, n_vit_blocks= 2, hidden_d= 8, 
+        heads= 2, mlp_size= 4, out_d= 10 
+    )
+    model.to(device)
+
+    optim = torch.optim.Adam(model.parameters(), lr = LR)
+    loss = torch.nn.CrossEntropyLoss()
+
+    for epoch in range(NUM_EPOCHS):
+        train_loss = 0.0
+        for batch in tqdm(train_loader, desc = f"Epoch {epoch + 1}"):
+            ims, labs = batch
+            ims, labs = ims.to(device), labs.to(device)
+
+            preds = model(ims)
+            loss_val = loss(preds, labs)
+
+            train_loss = loss_val.detach().cpu().item() / len(train_loader)
+
+            optim.zero_grad()
+            loss_val.backward()
+            optim.step()
+        print(f"Epoch {epoch + 1} / {NUM_EPOCHS} loss = {train_loss :.3}")
+
+    with torch.no_grad():
+        correct, total = 0.0
+        test_loss = 0.0
+
+        for batch in tqdm(test_loader, desc = "Testing"):
+            ims, labs = batch
+            ims, labs = ims.to(device), labs.to(device)
+
+            preds = model(ims)
+            loss_val = loss(preds, labs)
+
+            test_loss = loss_val.detach().cpu().item() / len(test_loader)
+
+            correct += torch.sum(torch.argmax(preds, dim=1) == labs).detach().cpu().item()
+            total += len(ims)
+
+        print(f"Test Loss: {test_loss :.3}")
+        print(f"Test Accuracy: {correct / total :.3}")
+
+        if test_loss < best_test_loss:
+            model_save_path = "vit_model.pth"
+            torch.save(model.state_dict(), model_save_path)
+            print(f"Model saved to {model_save_path}")
+
+            
 
 
 if __name__ == "__main__":
-    transform = transforms.ToTensor()
-    train = datasets.MNIST("./data", train=True, download=True, transform=transform)
-    train_loader = torch.utils.data.DataLoader(train)
-    images = torch.stack([img for batch in train_loader for img in batch[0]]) # create image tensor
-    x = patch(images, 4)
-    print(x.shape)
-    print(x[0].shape)
+    main()
+    # transform = transforms.ToTensor()
+    # train = datasets.MNIST("./data", train=True, download=True, transform=transform)
+    # train_loader = torch.utils.data.DataLoader(train)
+    # images = torch.stack([img for batch in train_loader for img in batch[0]]) # create image tensor
+    # x = patch(images, 4)
+    # print(x.shape)
+    # print(x[0].shape)
