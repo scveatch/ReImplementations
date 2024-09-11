@@ -4,7 +4,7 @@ A module that implements "An Image is worth 16x16 words" by Dosovitskiy et al.
 """
 # Hyperparameters 
 ##################################
-NUM_EPOCHS = 3
+NUM_EPOCHS = 1
 LR = 0.005
 
 import math # GCD, sqrt
@@ -323,29 +323,30 @@ def main():
             optim.step()
         print(f"Epoch {epoch + 1} / {NUM_EPOCHS} loss = {train_loss :.3}")
 
-    with torch.no_grad():
-        correct, total = 0.0
-        test_loss = 0.0
+        with torch.no_grad():
+            correct = 0.0
+            total = 0.0
+            test_loss = 0.0
 
-        for batch in tqdm(test_loader, desc = "Testing"):
-            ims, labs = batch
-            ims, labs = ims.to(device), labs.to(device)
+            for batch in tqdm(test_loader, desc = "Testing"):
+                ims, labs = batch
+                ims, labs = ims.to(device), labs.to(device)
 
-            preds = model(ims)
-            loss_val = loss(preds, labs)
+                preds = model(ims)
+                loss_val = loss(preds, labs)
 
-            test_loss = loss_val.detach().cpu().item() / len(test_loader)
+                test_loss = loss_val.detach().cpu().item() / len(test_loader)
 
-            correct += torch.sum(torch.argmax(preds, dim=1) == labs).detach().cpu().item()
-            total += len(ims)
+                correct += torch.sum(torch.argmax(preds, dim=1) == labs).detach().cpu().item()
+                total += len(ims)
 
-        print(f"Test Loss: {test_loss :.3}")
-        print(f"Test Accuracy: {correct / total :.3}")
+            print(f"Test Loss: {test_loss :.3}")
+            print(f"Test Accuracy: {correct / total :.3}")
 
-        if test_loss < best_test_loss:
-            model_save_path = "vit_model.pth"
-            torch.save(model.state_dict(), model_save_path)
-            print(f"Model saved to {model_save_path}")
+            if test_loss < best_test_loss:
+                model_save_path = "vit_model.pth"
+                torch.save(model.state_dict(), model_save_path)
+                print(f"Model saved to {model_save_path}")
 
             
 
